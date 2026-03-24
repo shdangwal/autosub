@@ -1,14 +1,4 @@
 {
-  "1": {
-    "inputs": {
-      "root_dir": "input",
-      "file": "[none]"
-    },
-    "class_type": "LoadText|pysssss",
-    "_meta": {
-      "title": "Load Text 🐍"
-    }
-  },
   "2": {
     "inputs": {
       "from_translate": "auto",
@@ -16,7 +6,7 @@
       "manual_translate": false,
       "Manual Trasnlate": "Manual Trasnlate",
       "text": [
-        "1",
+        "6",
         0
       ]
     },
@@ -25,24 +15,9 @@
       "title": "Google Translate Text Node"
     }
   },
-  "3": {
-    "inputs": {
-      "preview_markdown": "",
-      "preview_text": "",
-      "previewMode": null,
-      "source": [
-        "2",
-        0
-      ]
-    },
-    "class_type": "PreviewAny",
-    "_meta": {
-      "title": "Preview as Text"
-    }
-  },
   "4": {
     "inputs": {
-      "output_file_path": "/home/shdangwal/tools/realesrgan-ncnn-vulkan-20220424-ubuntu",
+      "output_file_path": "",
       "file_name": "test_video",
       "file_extension": "txt",
       "overwrite": true,
@@ -68,6 +43,31 @@
     "class_type": "PurgeVRAM",
     "_meta": {
       "title": "PurgeVRAM"
+    }
+  },
+  "6": {
+    "inputs": {
+      "file_path": "",
+      "dictionary_name": ""
+    },
+    "class_type": "Load Text File",
+    "_meta": {
+      "title": "Load Text File"
+    }
+  },
+  "8": {
+    "inputs": {
+      "preview_markdown": "",
+      "preview_text": "",
+      "previewMode": false,
+      "source": [
+        "2",
+        0
+      ]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Preview as Text"
     }
   }
 }

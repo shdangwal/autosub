@@ -33,10 +33,8 @@ NODE_FULL_SAVE_RAW = "32"
 NODE_FULL_SAVE_TRANS = "11"
 
 # For autosub_workflow_translate.json (Translation Only)
-NODE_TRANS_TEXT_INPUT = (
-    "1"  # <-- Node where you input the raw text (e.g., Load Text / String node)
-)
-NODE_TRANS_SAVE_TRANS = "11"  # <-- Node that saves the final translated text
+NODE_TRANS_TEXT_INPUT = "6"
+NODE_TRANS_SAVE_TRANS = "4"
 # =================================================
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -258,11 +256,13 @@ def main():
                         workflow = json.load(f)
 
                     # Read the raw text to inject into the translate workflow
-                    with open(raw_txt_path, "r", encoding="utf-8") as f:
-                        raw_content = f.read()
+                    # with open(raw_txt_path, "r", encoding="utf-8") as f:
+                    #     raw_content = f.read()
 
                     # Inject text into the target node (assumes a string primitive or text input node)
-                    workflow[NODE_TRANS_TEXT_INPUT]["inputs"]["text"] = raw_content
+                    workflow[NODE_TRANS_TEXT_INPUT]["inputs"]["file_path"] = (
+                        raw_txt_path
+                    )
                     workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["output_file_path"] = (
                         CACHE_DIR
                     )
@@ -315,7 +315,7 @@ def main():
                     trans_txt_path
                 ):
                     print_error(
-                        f"ComfyUI output missing for chunk {chunk_index}. Ensure Node IDs match your JSON."
+                        f"ComfyUI output missing for chunk {chunk_index + 1}. Ensure Node IDs match your JSON."
                     )
 
                 # Calculate Overlap Boundaries
