@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 import subprocess
 import shutil
+import math
 
 # ================= CONFIGURATION =================
 COMFY_API_URL = "http://127.0.0.1:8188"
@@ -231,6 +232,11 @@ def main():
             orig_srt_counter = 1
             chunk_index = 0
             current_start = 0.0
+            total_chunks = (
+                math.ceil(total_duration / (CHUNK_SECONDS - OVERLAP_SECONDS))
+                if total_duration
+                else 0
+            )
 
             while current_start < total_duration:
                 chunk_id = f"{TEMP_PREFIX}_{video_basename}_{chunk_index:03d}"
@@ -249,7 +255,7 @@ def main():
                 # CHECK CACHE: Decide which workflow to run
                 if os.path.exists(raw_txt_path) and os.path.getsize(raw_txt_path) > 0:
                     print_step(
-                        f"Chunk {chunk_index + 1}: Found cached raw text! Skipping ASR, running Translation only..."
+                        f"Chunk {chunk_index + 1}/{total_chunks} (Start: {current_start}s): Found cached raw text! Skipping ASR, running Translation only..."
                     )
 
                     with open(WORKFLOW_TRANS, "r", encoding="utf-8") as f:
@@ -272,7 +278,7 @@ def main():
 
                 else:
                     print_step(
-                        f"Chunk {chunk_index + 1}: Extracting audio and running FULL ASR + Translation..."
+                        f"Chunk {chunk_index + 1}/{total_chunks} (Start: {current_start}s): Extracting audio and running FULL ASR + Translation..."
                     )
                     extract_chunk(
                         master_wav_filepath,

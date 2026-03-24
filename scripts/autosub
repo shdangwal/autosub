@@ -52,18 +52,20 @@ def main():
     skipped_count = 0
     error_log = []  # List to track any files that fail
 
-    for video_file in sorted(video_files):
+    for idx, video_file in enumerate(sorted(video_files)):
         video_path = os.path.join(target_dir, video_file)
         base_name = os.path.splitext(video_file)[0]
         srt_path = os.path.join(target_dir, f"{base_name}.srt")
 
         # Skip if already processed
         if os.path.exists(srt_path):
-            print_skip(f"'{video_file}' already has an .srt file. Skipping.")
+            print_skip(
+                f"{idx}/{len(video_files)}: '{video_file}' already has an .srt file. Skipping."
+            )
             skipped_count += 1
             continue
 
-        print_info(f"Processing: '{video_file}'")
+        print_info(f"{idx}/{len(video_files)}: Processing: '{video_file}'")
 
         try:
             result = subprocess.run(["autosub_single", video_path])
@@ -89,6 +91,7 @@ def main():
     print_success(
         f"Batch run complete! Processed: {processed_count} | Skipped: {skipped_count}"
     )
+    print("=" * 50)
 
     # Print the consolidated error summary if any occurred
     if error_log:
