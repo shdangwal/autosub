@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+import sys
+import os
+import time
+import json
+import urllib.request
+import urllib.error
+import subprocess
+import shutil
+
+# ================= CONFIGURATION =================
+COMFY_API_URL = "http://127.0.0.1:8188"
+COMFY_INPUT_DIR = "/home/shdangwal/dev/ComfyUI/input"
+
+# Workflows
+WORKFLOW_FULL = os.path.expanduser("~/.config/comfyui/workflows/autosub_workflow.json")
+WORKFLOW_TRANS = os.path.expanduser(
+    "~/.config/comfyui/workflows/autosub_workflow_translate.json"
+)
+
+# Use a persistent cache instead of /tmp for recovery across reboots
+CACHE_DIR = os.path.expanduser("~/.cache/autosub")
+TEMP_PREFIX = "autosub_temp"
+
+CHUNK_SECONDS = 600
+OVERLAP_SECONDS = 10
+STEP_SECONDS = CHUNK_SECONDS - OVERLAP_SECONDS
+
+# === NODE CONFIGURATION (UPDATE THESE TO MATCH YOUR JSONS) ===
+# For autosub_workflow.json (Full Pipeline)
+NODE_FULL_AUDIO_LOAD = "31"
+NODE_FULL_SAVE_RAW = "32"
+NODE_FULL_SAVE_TRANS = "11"
+
+# For autosub_workflow_translate.json (Translation Only)
+NODE_TRANS_TEXT_INPUT = (
+    "1"  # <-- Node where you input the raw text (e.g., Load Text / String node)
+)
+NODE_TRANS_SAVE_TRANS = "11"  # <-- Node that saves the final translated text
+# =================================================
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def print_step(msg):
+    print(f"\033[94m[INFO]\033[0m {msg}")
+
+
+def print_success(msg):
+    print(f"\033[92m[SUCCESS]\033[0m {msg}")
+
+
+def print_error(msg):
+    print(f"\033[91m[ERROR]\033[0m {msg}")
+    sys.exit(1)
+
+
+def check_comfyui():
+    try:
+        urllib.request.urlopen(f"{COMFY_API_URL}/system_stats", timeout=2)
+        return True
+    except (urllib.error.URLError, ConnectionResetError):
+        return False
+
+
+def get_audio_duration(file_path):
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+        return float(result.stdout.strip())
+    except Exception:
+        print_error("Failed to read media duration. Is ffprobe installed?")
+
+
+def extract_base_audio(video_path, temp_wav_path):
+    print_step("Extracting raw master audio with mpv...")
+    res = subprocess.run(
+        ["mpv", video_path, "--no-video", "--ao=pcm", f"--ao-pcm-file={temp_wav_path}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if res.returncode != 0:
+        print_error("mpv failed to extract audio.")
+
+
+def extract_chunk(input_wav, output_mp3, start_time, duration):
+    res = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_wav,
+            "-ss",
+            str(start_time),
+            "-t",
+            str(duration),
+            "-acodec",
+            "libmp3lame",
+            "-ab",
+            "128k",
+            output_mp3,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if res.returncode != 0:
+        print_error(f"ffmpeg failed to extract chunk starting at {start_time}s.")
+
+
+def queue_prompt(prompt_workflow):
+    req = urllib.request.Request(
+        f"{COMFY_API_URL}/prompt",
+        data=json.dumps({"prompt": prompt_workflow}).encode("utf-8"),
+    )
+    return json.loads(urllib.request.urlopen(req).read())
+
+
+def get_history(prompt_id):
+    req = urllib.request.Request(f"{COMFY_API_URL}/history/{prompt_id}")
+    return json.loads(urllib.request.urlopen(req).read())
+
+
+def format_srt_time(sec_float):
+    hours, remainder = divmod(sec_float, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    seconds = int(seconds)
+    if ms >= 1000:
+        seconds += 1
+        ms -= 1000
+    if seconds >= 60:
+        minutes += 1
+        seconds -= 60
+    if minutes >= 60:
+        hours += 1
+        minutes -= 60
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{int(ms):03d}"
+
+
+def process_and_append_srt(
+    input_txt_path,
+    output_srt_file,
+    time_offset,
+    min_keep_time,
+    max_keep_time,
+    current_srt_counter,
+):
+    with open(input_txt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            time_part, text_part = line.split(":", 1)
+            text_part = text_part.strip()
+            start_str, end_str = time_part.split("-")
+            global_start = float(start_str) + time_offset
+            global_end = float(end_str) + time_offset
+        except ValueError:
+            continue
+
+        if global_start < min_keep_time or global_start >= max_keep_time:
+            continue
+
+        output_srt_file.write(f"{current_srt_counter}\n")
+        output_srt_file.write(
+            f"{format_srt_time(global_start)} --> {format_srt_time(global_end)}\n"
+        )
+        output_srt_file.write(f"{text_part}\n\n")
+        current_srt_counter += 1
+    return current_srt_counter
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_error("Usage: autosub <video_file.mp4>")
+    video_path = os.path.abspath(sys.argv[1])
+    if not os.path.exists(video_path):
+        print_error(f"File not found: {video_path}")
+    if not check_comfyui():
+        print_error("ComfyUI is not running!")
+    if not os.path.exists(WORKFLOW_FULL) or not os.path.exists(WORKFLOW_TRANS):
+        print_error("One or both Workflow JSON files are missing in ~/.config/")
+
+    video_dir = os.path.dirname(video_path)
+    video_basename = os.path.splitext(os.path.basename(video_path))[0]
+
+    master_wav_filepath = os.path.join(
+        CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_master.wav"
+    )
+
+    # Final outputs
+    final_srt_filepath = os.path.join(video_dir, f"{video_basename}.srt")
+    final_orig_srt_filepath = os.path.join(video_dir, f"{video_basename}.orig.srt")
+
+    # Temporary working files for safety
+    temp_srt_filepath = os.path.join(
+        CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_FINAL.srt"
+    )
+    temp_orig_srt_filepath = os.path.join(
+        CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_FINAL.orig.srt"
+    )
+
+    mp3s_to_cleanup = [master_wav_filepath]
+    texts_to_cleanup = []
+
+    try:
+        extract_base_audio(video_path, master_wav_filepath)
+        total_duration = get_audio_duration(master_wav_filepath)
+        print_step(f"Media duration: {total_duration:.2f}s. Calculating windows...")
+
+        with (
+            open(temp_srt_filepath, "w", encoding="utf-8") as srt_out,
+            open(temp_orig_srt_filepath, "w", encoding="utf-8") as orig_srt_out,
+        ):
+            srt_counter = 1
+            orig_srt_counter = 1
+            chunk_index = 0
+            current_start = 0.0
+
+            while current_start < total_duration:
+                chunk_id = f"{TEMP_PREFIX}_{video_basename}_{chunk_index:03d}"
+                chunk_mp3_name = f"{chunk_id}.mp3"
+                chunk_mp3_path = os.path.join(COMFY_INPUT_DIR, chunk_mp3_name)
+                mp3s_to_cleanup.append(chunk_mp3_path)
+
+                raw_txt_name = f"{chunk_id}_raw"
+                trans_txt_name = f"{chunk_id}_trans"
+
+                raw_txt_path = os.path.join(CACHE_DIR, f"{raw_txt_name}.txt")
+                trans_txt_path = os.path.join(CACHE_DIR, f"{trans_txt_name}.txt")
+
+                texts_to_cleanup.extend([raw_txt_path, trans_txt_path])
+
+                # CHECK CACHE: Decide which workflow to run
+                if os.path.exists(raw_txt_path) and os.path.getsize(raw_txt_path) > 0:
+                    print_step(
+                        f"Chunk {chunk_index + 1}: Found cached raw text! Skipping ASR, running Translation only..."
+                    )
+
+                    with open(WORKFLOW_TRANS, "r", encoding="utf-8") as f:
+                        workflow = json.load(f)
+
+                    # Read the raw text to inject into the translate workflow
+                    with open(raw_txt_path, "r", encoding="utf-8") as f:
+                        raw_content = f.read()
+
+                    # Inject text into the target node (assumes a string primitive or text input node)
+                    workflow[NODE_TRANS_TEXT_INPUT]["inputs"]["text"] = raw_content
+                    workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["output_file_path"] = (
+                        CACHE_DIR
+                    )
+                    workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["file_name"] = (
+                        trans_txt_name
+                    )
+
+                else:
+                    print_step(
+                        f"Chunk {chunk_index + 1}: Extracting audio and running FULL ASR + Translation..."
+                    )
+                    extract_chunk(
+                        master_wav_filepath,
+                        chunk_mp3_path,
+                        current_start,
+                        CHUNK_SECONDS,
+                    )
+
+                    with open(WORKFLOW_FULL, "r", encoding="utf-8") as f:
+                        workflow = json.load(f)
+
+                    workflow[NODE_FULL_AUDIO_LOAD]["inputs"]["audio"] = chunk_mp3_name
+
+                    # Save RAW output
+                    workflow[NODE_FULL_SAVE_RAW]["inputs"]["output_file_path"] = (
+                        CACHE_DIR
+                    )
+                    workflow[NODE_FULL_SAVE_RAW]["inputs"]["file_name"] = raw_txt_name
+
+                    # Save TRANSLATED output
+                    workflow[NODE_FULL_SAVE_TRANS]["inputs"]["output_file_path"] = (
+                        CACHE_DIR
+                    )
+                    workflow[NODE_FULL_SAVE_TRANS]["inputs"]["file_name"] = (
+                        trans_txt_name
+                    )
+
+                # Queue and Poll ComfyUI
+                prompt_id = queue_prompt(workflow)["prompt_id"]
+                while True:
+                    if prompt_id in get_history(prompt_id):
+                        break
+                    sys.stdout.write(".")
+                    sys.stdout.flush()
+                    time.sleep(2)
+                print()
+
+                # Validate Outputs
+                if not os.path.exists(raw_txt_path) or not os.path.exists(
+                    trans_txt_path
+                ):
+                    print_error(
+                        f"ComfyUI output missing for chunk {chunk_index}. Ensure Node IDs match your JSON."
+                    )
+
+                # Calculate Overlap Boundaries
+                min_keep = (
+                    0.0 if chunk_index == 0 else current_start + (OVERLAP_SECONDS / 2)
+                )
+                max_keep = (
+                    float("inf")
+                    if current_start + CHUNK_SECONDS >= total_duration
+                    else current_start + CHUNK_SECONDS - (OVERLAP_SECONDS / 2)
+                )
+
+                # Process and append both files
+                orig_srt_counter = process_and_append_srt(
+                    raw_txt_path,
+                    orig_srt_out,
+                    current_start,
+                    min_keep,
+                    max_keep,
+                    orig_srt_counter,
+                )
+                srt_counter = process_and_append_srt(
+                    trans_txt_path,
+                    srt_out,
+                    current_start,
+                    min_keep,
+                    max_keep,
+                    srt_counter,
+                )
+
+                current_start += STEP_SECONDS
+                chunk_index += 1
+
+        # SUCCESS: Move both temp SRTs to final destinations
+        shutil.move(temp_orig_srt_filepath, final_orig_srt_filepath)
+        shutil.move(temp_srt_filepath, final_srt_filepath)
+        print_success(
+            f"Done! Saved:\n - {final_srt_filepath}\n - {final_orig_srt_filepath}"
+        )
+
+        # ONLY delete cached text files upon complete video success
+        for txt_file in texts_to_cleanup:
+            if os.path.exists(txt_file):
+                os.remove(txt_file)
+
+    finally:
+        # Always clean up audio/mp3 files and the temp SRTs (if they weren't successfully moved)
+        for file in mp3s_to_cleanup + [temp_srt_filepath, temp_orig_srt_filepath]:
+            if os.path.exists(file):
+                try:
+                    os.remove(file)
+                except Exception:
+                    pass
+
+
+if __name__ == "__main__":
+    main()

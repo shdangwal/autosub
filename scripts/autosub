@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+
+# Define the video formats you want to process
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+
+
+def print_info(msg):
+    print(f"\033[96m[BATCH INFO]\033[0m {msg}")
+
+
+def print_success(msg):
+    print(f"\033[92m[BATCH SUCCESS]\033[0m {msg}")
+
+
+def print_skip(msg):
+    print(f"\033[93m[BATCH SKIP]\033[0m {msg}")
+
+
+def print_error(msg):
+    print(f"\033[91m[BATCH ERROR]\033[0m {msg}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print_error("Usage: autosub <directory_path>")
+        sys.exit(1)
+
+    print(sys.argv[0], sys.argv[1])
+    target_dir = os.path.abspath(sys.argv[1])
+    print(target_dir)
+    if not os.path.isdir(target_dir):
+        print_error(f"Directory not found: {target_dir}")
+        sys.exit(1)
+
+    print_info(f"Scanning directory: {target_dir}")
+
+    all_files = os.listdir(target_dir)
+    video_files = [
+        f for f in all_files if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS
+    ]
+
+    if not video_files:
+        print_info("No video files found in the specified directory.")
+        return
+
+    print_info(f"Found {len(video_files)} video file(s). Starting batch process...\n")
+
+    processed_count = 0
+    skipped_count = 0
+    error_log = []  # List to track any files that fail
+
+    for video_file in sorted(video_files):
+        video_path = os.path.join(target_dir, video_file)
+        base_name = os.path.splitext(video_file)[0]
+        srt_path = os.path.join(target_dir, f"{base_name}.srt")
+
+        # Skip if already processed
+        if os.path.exists(srt_path):
+            print_skip(f"'{video_file}' already has an .srt file. Skipping.")
+            skipped_count += 1
+            continue
+
+        print_info(f"Processing: '{video_file}'")
+
+        try:
+            result = subprocess.run(["autosub_single", video_path])
+            if result.returncode == 0:
+                processed_count += 1
+            else:
+                print_error(f"autosub failed on '{video_file}'.")
+                # Record the failure for the final summary
+                error_log.append(
+                    f"Failed on: '{video_file}' (Exit code: {result.returncode})"
+                )
+        except FileNotFoundError:
+            fatal_msg = "FATAL: The 'autosub' command was not found in PATH."
+            print_error(fatal_msg)
+            error_log.append(fatal_msg)
+            # If the command doesn't exist, no point in continuing the loop
+            break
+
+        print("-" * 50)
+
+    # Fnal Output
+    print("\n" + "=" * 50)
+    print_success(
+        f"Batch run complete! Processed: {processed_count} | Skipped: {skipped_count}"
+    )
+
+    # Print the consolidated error summary if any occurred
+    if error_log:
+        print(
+            "\n\033[91m[ERROR SUMMARY]\033[0m The following issues occurred during the run:"
+        )
+        for error_msg in error_log:
+            print(f" - {error_msg}")
+        print("=" * 50)
+
+
+if __name__ == "__main__":
+    main()

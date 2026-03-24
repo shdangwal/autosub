@@ -1,0 +1,110 @@
+{
+  "8": {
+    "inputs": {
+      "preview_markdown": "",
+      "preview_text": "",
+      "previewMode": null,
+      "source": ["24", 1]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Preview as Text"
+    }
+  },
+  "11": {
+    "inputs": {
+      "output_file_path": "",
+      "file_name": "test_video",
+      "file_extension": "txt",
+      "overwrite": true,
+      "text": ["16", 0]
+    },
+    "class_type": "easy saveText",
+    "_meta": {
+      "title": "Save Text"
+    }
+  },
+  "16": {
+    "inputs": {
+      "from_translate": "auto",
+      "to_translate": "en",
+      "manual_translate": false,
+      "Manual Trasnlate": "Manual Trasnlate",
+      "text": ["24", 1]
+    },
+    "class_type": "GoogleTranslateTextNode",
+    "_meta": {
+      "title": "Google Translate Text Node"
+    }
+  },
+  "24": {
+    "inputs": {
+      "model": "Qwen/Qwen3-ASR-0.6B",
+      "precision": "fp16",
+      "attention": "sdpa",
+      "forced_aligner": "Qwen/Qwen3-ForcedAligner-0.6B",
+      "language": "auto",
+      "hints": "",
+      "output_format": "srt",
+      "output_path": "",
+      "split_mode": "split_by_punctuation_or_pause_or_length",
+      "max_gap_sec": 0.6,
+      "max_chars": 40,
+      "max_inference_batch_size": 2,
+      "max_new_tokens": 256,
+      "unload_models": true,
+      "audio": ["31", 0]
+    },
+    "class_type": "AILab_Qwen3ASRSubtitle",
+    "_meta": {
+      "title": "Subtitle (QwenASR)"
+    }
+  },
+  "26": {
+    "inputs": {
+      "purge_cache": true,
+      "purge_models": true,
+      "anything": ["11", 0]
+    },
+    "class_type": "PurgeVRAM",
+    "_meta": {
+      "title": "PurgeVRAM"
+    }
+  },
+  "29": {
+    "inputs": {
+      "preview_markdown": "",
+      "preview_text": "",
+      "previewMode": null,
+      "source": ["16", 0]
+    },
+    "class_type": "PreviewAny",
+    "_meta": {
+      "title": "Preview as Text"
+    }
+  },
+  "31": {
+    "inputs": {
+      "audio": "",
+      "audioUI": "/api/view?filename=output_audio1.wav&type=input&subfolder=&rand=0.7515776220849236"
+    },
+    "class_type": "LoadAudio",
+    "_meta": {
+      "title": "Load Audio"
+    }
+  },
+  "32": {
+    "inputs": {
+      "output_file_path": "",
+      "file_name": "test_video",
+      "file_extension": "txt",
+      "overwrite": true,
+      "text": ["24", 1]
+    },
+    "class_type": "easy saveText",
+    "_meta": {
+      "title": "Save Text"
+    }
+  }
+}
+
