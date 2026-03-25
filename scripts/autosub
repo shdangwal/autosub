@@ -60,12 +60,12 @@ def main():
         # Skip if already processed
         if os.path.exists(srt_path):
             print_skip(
-                f"{idx}/{len(video_files)}: '{video_file}' already has an .srt file. Skipping."
+                f"{idx + 1}/{len(video_files)}: '{video_file}' already has an .srt file. Skipping."
             )
             skipped_count += 1
             continue
 
-        print_info(f"{idx}/{len(video_files)}: Processing: '{video_file}'")
+        print_info(f"{idx + 1}/{len(video_files)}: Processing: '{video_file}'")
 
         try:
             result = subprocess.run(["autosub_single", video_path])
