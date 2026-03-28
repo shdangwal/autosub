@@ -23,8 +23,8 @@ WORKFLOW_TRANS = os.path.expanduser(
 CACHE_DIR = os.path.expanduser("~/.cache/autosub")
 TEMP_PREFIX = "autosub_temp"
 
-CHUNK_SECONDS = 600
-OVERLAP_SECONDS = 10
+CHUNK_SECONDS = 150
+OVERLAP_SECONDS = 8
 STEP_SECONDS = CHUNK_SECONDS - OVERLAP_SECONDS
 
 # === NODE CONFIGURATION (UPDATE THESE TO MATCH YOUR JSONS) ===
@@ -366,7 +366,8 @@ def main():
         for txt_file in texts_to_cleanup:
             if os.path.exists(txt_file):
                 os.remove(txt_file)
-
+    except Exception as ex:
+        print(ex)
     finally:
         # Always clean up audio/mp3 files and the temp SRTs (if they weren't successfully moved)
         for file in mp3s_to_cleanup + [temp_srt_filepath, temp_orig_srt_filepath]:

@@ -49,9 +49,9 @@
       "output_path": "",
       "split_mode": "split_by_punctuation_or_pause_or_length",
       "max_gap_sec": 0.6,
-      "max_chars": 40,
+      "max_chars": 0,
       "max_inference_batch_size": 2,
-      "max_new_tokens": 256,
+      "max_new_tokens": 2000,
       "unload_models": true,
       "audio": ["31", 0]
     },
@@ -107,4 +107,3 @@
     }
   }
 }
-
