@@ -6,8 +6,7 @@ import json
 import urllib.request
 import urllib.error
 import subprocess
-import shutil
-import math
+import re
 
 # ================= CONFIGURATION =================
 COMFY_API_URL = "http://127.0.0.1:8188"
@@ -23,19 +22,25 @@ WORKFLOW_TRANS = os.path.expanduser(
 CACHE_DIR = os.path.expanduser("~/.cache/autosub")
 TEMP_PREFIX = "autosub_temp"
 
-CHUNK_SECONDS = 100
-OVERLAP_SECONDS = 10
-STEP_SECONDS = CHUNK_SECONDS - OVERLAP_SECONDS
+# Chunking
+GLOBAL_CHUNK_SECONDS = 300
+MIN_CHUNK_SECONDS = 30
+SILENCE_NOISE_DB = -30
+SILENCE_MIN_DURATION = 0.3
+SILENCE_SNAP_WINDOW = 30  # how far (seconds) from target split to look for silence
 
 # === NODE CONFIGURATION (UPDATE THESE TO MATCH YOUR JSONS) ===
 # For autosub_workflow.json (Full Pipeline)
 NODE_FULL_AUDIO_LOAD = "31"
+NODE_FULL_ASR = "24"
+NODE_FULL_PURGE = "26"
 NODE_FULL_SAVE_RAW = "32"
 NODE_FULL_SAVE_TRANS = "11"
 
 # For autosub_workflow_translate.json (Translation Only)
 NODE_TRANS_TEXT_INPUT = "6"
 NODE_TRANS_SAVE_TRANS = "4"
+NODE_TRANS_PURGE = "5"
 # =================================================
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -49,9 +54,28 @@ def print_success(msg):
     print(f"\033[92m[SUCCESS]\033[0m {msg}")
 
 
+def print_warn(msg):
+    print(f"\033[93m[WARN]\033[0m {msg}")
+
+
+class AutoSubError(Exception):
+    """Recoverable pipeline error."""
+
+
+class OOMError(AutoSubError):
+    """ComfyUI ran out of VRAM."""
+
+
 def print_error(msg):
     print(f"\033[91m[ERROR]\033[0m {msg}")
+
+
+def fatal(msg):
+    print_error(msg)
     sys.exit(1)
+
+
+# ================= COMFYUI API =================
 
 
 def check_comfyui():
@@ -60,6 +84,41 @@ def check_comfyui():
         return True
     except (urllib.error.URLError, ConnectionResetError):
         return False
+
+
+def queue_prompt(prompt_workflow):
+    req = urllib.request.Request(
+        f"{COMFY_API_URL}/prompt",
+        data=json.dumps({"prompt": prompt_workflow}).encode("utf-8"),
+    )
+    return json.loads(urllib.request.urlopen(req).read())
+
+
+def get_history(prompt_id):
+    req = urllib.request.Request(f"{COMFY_API_URL}/history/{prompt_id}")
+    return json.loads(urllib.request.urlopen(req).read())
+
+
+def poll_prompt(prompt_id):
+    """Poll ComfyUI until the prompt completes. Raises OOMError or AutoSubError on failure."""
+    while True:
+        history = get_history(prompt_id)
+        if prompt_id in history:
+            entry = history[prompt_id]
+            status = entry.get("status", {})
+            if status.get("status_str") == "error":
+                msgs = status.get("messages", [])
+                err_text = json.dumps(msgs) if msgs else "Unknown ComfyUI error"
+                if "out of memory" in err_text.lower() or "oom" in err_text.lower():
+                    raise OOMError(f"ComfyUI OOM: {err_text}")
+                raise AutoSubError(f"ComfyUI execution failed: {err_text}")
+            return entry
+        sys.stdout.write(".")
+        sys.stdout.flush()
+        time.sleep(2)
+
+
+# ================= AUDIO HELPERS =================
 
 
 def get_audio_duration(file_path):
@@ -83,27 +142,104 @@ def get_audio_duration(file_path):
         )
         return float(result.stdout.strip())
     except Exception:
-        print_error("Failed to read media duration. Is ffprobe installed?")
+        raise AutoSubError("Failed to read media duration. Is ffprobe installed?")
 
 
-def extract_base_audio(video_path, temp_wav_path):
-    print_step("Extracting raw master audio with lpv...")
-    res = subprocess.run(
-        ["lpv", video_path, "--no-video", "--ao=pcm", f"--ao-pcm-file={temp_wav_path}"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if res.returncode != 0:
-        print_error("lpv failed to extract audio.")
+def extract_base_audio(video_path, output_flac_path):
+    """Extract full audio via lpv (mpv 37.0) → pipe → ffmpeg → FLAC."""
+    print_step("Extracting master audio: lpv → ffmpeg → FLAC...")
+    temp_wav = output_flac_path + ".tmp.wav"
+    try:
+        res = subprocess.run(
+            [
+                "lpv",
+                video_path,
+                "--no-video",
+                "--ao=pcm",
+                f"--ao-pcm-file={temp_wav}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode != 0:
+            raise AutoSubError("lpv failed to extract audio.")
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-i", temp_wav, "-c:a", "flac", output_flac_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if res.returncode != 0:
+            raise AutoSubError("ffmpeg failed to convert WAV to FLAC.")
+    finally:
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
 
 
-def extract_chunk(input_wav, output_mp3, start_time, duration):
+def detect_silences(audio_path):
+    """Run ffmpeg silencedetect and return list of (start, end) silence intervals."""
+    cmd = [
+        "ffmpeg",
+        "-i",
+        audio_path,
+        "-af",
+        f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_DURATION}",
+        "-f",
+        "null",
+        "-",
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    silences = []
+    starts = re.findall(r"silence_start: ([\d.]+)", result.stderr)
+    ends = re.findall(r"silence_end: ([\d.]+)", result.stderr)
+    for s, e in zip(starts, ends):
+        silences.append((float(s), float(e)))
+    return silences
+
+
+def build_chunk_boundaries(total_duration, target_chunk_size, silences, region_start=0.0):
+    """Build chunk boundaries snapping to silence points near target split points.
+
+    All timestamps (silences, region_start, total_duration) are in global time.
+    Returns list of (start, end) tuples covering [region_start, total_duration].
+    No overlap — boundaries land on silence midpoints.
+    """
+    region_length = total_duration - region_start
+    if region_length <= target_chunk_size:
+        return [(region_start, total_duration)]
+
+    boundaries = []
+    current_start = region_start
+
+    while current_start < total_duration:
+        remaining = total_duration - current_start
+        if remaining <= target_chunk_size + SILENCE_SNAP_WINDOW:
+            boundaries.append((current_start, total_duration))
+            break
+
+        target_split = current_start + target_chunk_size
+        best_split = target_split
+        best_distance = float("inf")
+
+        for s_start, s_end in silences:
+            midpoint = (s_start + s_end) / 2
+            distance = abs(midpoint - target_split)
+            if distance < best_distance and distance <= SILENCE_SNAP_WINDOW:
+                best_split = midpoint
+                best_distance = distance
+
+        boundaries.append((current_start, best_split))
+        current_start = best_split
+
+    return boundaries
+
+
+def extract_chunk(input_audio, output_mp3, start_time, duration):
     res = subprocess.run(
         [
             "ffmpeg",
             "-y",
             "-i",
-            input_wav,
+            input_audio,
             "-ss",
             str(start_time),
             "-t",
@@ -118,20 +254,73 @@ def extract_chunk(input_wav, output_mp3, start_time, duration):
         stderr=subprocess.DEVNULL,
     )
     if res.returncode != 0:
-        print_error(f"ffmpeg failed to extract chunk starting at {start_time}s.")
+        raise AutoSubError(f"ffmpeg failed to extract chunk starting at {start_time}s.")
 
 
-def queue_prompt(prompt_workflow):
-    req = urllib.request.Request(
-        f"{COMFY_API_URL}/prompt",
-        data=json.dumps({"prompt": prompt_workflow}).encode("utf-8"),
-    )
-    return json.loads(urllib.request.urlopen(req).read())
+# ================= MANIFEST =================
 
 
-def get_history(prompt_id):
-    req = urllib.request.Request(f"{COMFY_API_URL}/history/{prompt_id}")
-    return json.loads(urllib.request.urlopen(req).read())
+def manifest_path(video_basename):
+    return os.path.join(CACHE_DIR, f"{video_basename}_manifest.json")
+
+
+def load_manifest(video_basename, video_path):
+    """Load existing manifest if valid, otherwise return None."""
+    mp = manifest_path(video_basename)
+    if not os.path.exists(mp):
+        return None
+    try:
+        with open(mp, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        # Validate that the video hasn't changed
+        if m.get("video_mtime") != os.path.getmtime(video_path):
+            print_warn("Video file changed since last run. Starting fresh.")
+            return None
+        return m
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+
+def save_manifest(m, video_basename):
+    mp = manifest_path(video_basename)
+    with open(mp, "w", encoding="utf-8") as f:
+        json.dump(m, f, indent=2)
+
+
+def create_manifest(video_path, video_basename, total_duration, effective_chunk_size, boundaries):
+    chunks = []
+    for i, (start, end) in enumerate(boundaries):
+        chunk_id = f"{TEMP_PREFIX}_{video_basename}_{i:03d}"
+        chunks.append(
+            {
+                "index": i,
+                "start": start,
+                "end": end,
+                "chunk_size_used": effective_chunk_size,
+                "status": "pending",
+                "raw_txt": f"{chunk_id}_raw.txt",
+                "trans_txt": f"{chunk_id}_trans.txt",
+            }
+        )
+    return {
+        "version": 1,
+        "video_path": video_path,
+        "video_mtime": os.path.getmtime(video_path),
+        "global_chunk_size": GLOBAL_CHUNK_SECONDS,
+        "effective_chunk_size": effective_chunk_size,
+        "total_duration": total_duration,
+        "master_audio": f"{TEMP_PREFIX}_{video_basename}_master.flac",
+        "chunks": chunks,
+    }
+
+
+def delete_manifest(video_basename):
+    mp = manifest_path(video_basename)
+    if os.path.exists(mp):
+        os.remove(mp)
+
+
+# ================= SRT =================
 
 
 def format_srt_time(sec_float):
@@ -151,14 +340,9 @@ def format_srt_time(sec_float):
     return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d},{int(ms):03d}"
 
 
-def process_and_append_srt(
-    input_txt_path,
-    output_srt_file,
-    time_offset,
-    min_keep_time,
-    max_keep_time,
-    current_srt_counter,
-):
+def process_srt_entries(input_txt_path, time_offset, min_keep_time, max_keep_time):
+    """Parse a raw/translated text file and return list of (global_start, global_end, text) tuples."""
+    entries = []
     with open(input_txt_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     for line in lines:
@@ -173,209 +357,315 @@ def process_and_append_srt(
             global_end = float(end_str) + time_offset
         except ValueError:
             continue
-
         if global_start < min_keep_time or global_start >= max_keep_time:
             continue
+        entries.append((global_start, global_end, text_part))
+    return entries
 
-        output_srt_file.write(f"{current_srt_counter}\n")
-        output_srt_file.write(
-            f"{format_srt_time(global_start)} --> {format_srt_time(global_end)}\n"
+
+def build_srt_from_manifest(m, srt_type):
+    """Build a complete SRT string from all complete chunks in the manifest.
+
+    srt_type: "raw" for orig.srt, "trans" for .srt
+    """
+    # raw text exists for asr_complete and complete chunks
+    # trans text only exists for complete chunks
+    valid_statuses = {"asr_complete", "complete"} if srt_type == "raw" else {"complete"}
+
+    lines = []
+    counter = 1
+    for chunk in m["chunks"]:
+        if chunk["status"] not in valid_statuses:
+            continue
+
+        txt_key = "raw_txt" if srt_type == "raw" else "trans_txt"
+        txt_path = os.path.join(CACHE_DIR, chunk[txt_key])
+        if not os.path.exists(txt_path):
+            continue
+
+        entries = process_srt_entries(
+            txt_path,
+            time_offset=chunk["start"],
+            min_keep_time=chunk["start"],
+            max_keep_time=chunk["end"],
         )
-        output_srt_file.write(f"{text_part}\n\n")
-        current_srt_counter += 1
-    return current_srt_counter
+        for global_start, global_end, text in entries:
+            lines.append(f"{counter}\n")
+            lines.append(f"{format_srt_time(global_start)} --> {format_srt_time(global_end)}\n")
+            lines.append(f"{text}\n\n")
+            counter += 1
+    return "".join(lines)
+
+
+# ================= WORKFLOW HELPERS =================
+
+
+def load_full_workflow(chunk_mp3_name, raw_txt_name, trans_txt_name, purge_vram):
+    with open(WORKFLOW_FULL, "r", encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    workflow[NODE_FULL_AUDIO_LOAD]["inputs"]["audio"] = chunk_mp3_name
+    workflow[NODE_FULL_SAVE_RAW]["inputs"]["output_file_path"] = CACHE_DIR
+    workflow[NODE_FULL_SAVE_RAW]["inputs"]["file_name"] = raw_txt_name
+    workflow[NODE_FULL_SAVE_TRANS]["inputs"]["output_file_path"] = CACHE_DIR
+    workflow[NODE_FULL_SAVE_TRANS]["inputs"]["file_name"] = trans_txt_name
+
+    # Performance: keep models loaded between chunks unless recovering from OOM
+    workflow[NODE_FULL_ASR]["inputs"]["unload_models"] = purge_vram
+    workflow[NODE_FULL_ASR]["inputs"]["max_inference_batch_size"] = 1
+    workflow[NODE_FULL_PURGE]["inputs"]["purge_cache"] = purge_vram
+    workflow[NODE_FULL_PURGE]["inputs"]["purge_models"] = purge_vram
+
+    return workflow
+
+
+def load_trans_workflow(raw_txt_path, trans_txt_name, purge_vram):
+    with open(WORKFLOW_TRANS, "r", encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    workflow[NODE_TRANS_TEXT_INPUT]["inputs"]["file_path"] = raw_txt_path
+    workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["output_file_path"] = CACHE_DIR
+    workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["file_name"] = trans_txt_name
+    workflow[NODE_TRANS_PURGE]["inputs"]["purge_cache"] = purge_vram
+    workflow[NODE_TRANS_PURGE]["inputs"]["purge_models"] = purge_vram
+
+    return workflow
+
+
+# ================= CHUNK PROCESSING =================
+
+
+def process_chunk(chunk, video_basename, master_audio_path, purge_vram):
+    """Process a single chunk through ComfyUI. Returns updated chunk dict.
+
+    Raises OOMError if ComfyUI runs out of VRAM.
+    Raises AutoSubError for other failures.
+    """
+    i = chunk["index"]
+    start = chunk["start"]
+    end = chunk["end"]
+    duration = end - start
+
+    chunk_id = f"{TEMP_PREFIX}_{video_basename}_{i:03d}"
+    chunk_mp3_name = f"{chunk_id}.mp3"
+    chunk_mp3_path = os.path.join(COMFY_INPUT_DIR, chunk_mp3_name)
+
+    raw_txt_name = f"{chunk_id}_raw"
+    trans_txt_name = f"{chunk_id}_trans"
+    raw_txt_path = os.path.join(CACHE_DIR, chunk["raw_txt"])
+    trans_txt_path = os.path.join(CACHE_DIR, chunk["trans_txt"])
+
+    try:
+        if chunk["status"] == "asr_complete":
+            # Raw text exists, only need translation
+            print_step(f"  Cached raw text found. Running translation only...")
+            workflow = load_trans_workflow(raw_txt_path, trans_txt_name, purge_vram)
+        else:
+            # Full pipeline: extract audio chunk → ASR → translate
+            print_step(f"  Extracting audio chunk ({duration:.1f}s) and running full pipeline...")
+            extract_chunk(master_audio_path, chunk_mp3_path, start, duration)
+            workflow = load_full_workflow(chunk_mp3_name, raw_txt_name, trans_txt_name, purge_vram)
+
+        prompt_id = queue_prompt(workflow)["prompt_id"]
+        poll_prompt(prompt_id)
+        print()  # newline after dots
+
+        # Validate outputs and update status
+        raw_exists = os.path.exists(raw_txt_path) and os.path.getsize(raw_txt_path) > 0
+        trans_exists = os.path.exists(trans_txt_path) and os.path.getsize(trans_txt_path) > 0
+
+        if chunk["status"] != "asr_complete" and raw_exists and not trans_exists:
+            chunk["status"] = "asr_complete"
+        elif raw_exists and trans_exists:
+            chunk["status"] = "complete"
+        else:
+            raise AutoSubError(f"ComfyUI output missing for chunk {i + 1}. Check Node IDs.")
+
+    finally:
+        # Always clean up the chunk mp3 from ComfyUI input dir
+        if os.path.exists(chunk_mp3_path):
+            os.remove(chunk_mp3_path)
+
+    return chunk
+
+
+# ================= RE-SPLIT ON OOM =================
+
+
+def resplit_remaining(m, failed_index, new_size, video_basename, master_audio_path):
+    """Re-split all chunks from failed_index onward using a smaller chunk size.
+
+    Silences are detected in global time and passed directly to build_chunk_boundaries
+    which also works in global time (via the region_start parameter).
+    """
+    resplit_start = m["chunks"][failed_index]["start"]
+    total_duration = m["total_duration"]
+
+    silences = detect_silences(master_audio_path)
+    # Only silences in the remaining region matter
+    remaining_silences = [(s, e) for s, e in silences if e > resplit_start]
+
+    new_boundaries = build_chunk_boundaries(
+        total_duration, new_size, remaining_silences, region_start=resplit_start
+    )
+
+    kept_chunks = [c for c in m["chunks"] if c["index"] < failed_index]
+    new_chunks = []
+    for j, (start, end) in enumerate(new_boundaries):
+        idx = len(kept_chunks) + j
+        chunk_id = f"{TEMP_PREFIX}_{video_basename}_{idx:03d}"
+        new_chunks.append(
+            {
+                "index": idx,
+                "start": start,
+                "end": end,
+                "chunk_size_used": new_size,
+                "status": "pending",
+                "raw_txt": f"{chunk_id}_raw.txt",
+                "trans_txt": f"{chunk_id}_trans.txt",
+            }
+        )
+
+    m["chunks"] = kept_chunks + new_chunks
+    m["effective_chunk_size"] = new_size
+    return m
+
+
+# ================= MAIN =================
 
 
 def main():
     if len(sys.argv) < 2:
-        print_error("Usage: autosub <video_file.mp4>")
+        fatal("Usage: autosub_single <video_file>")
     video_path = os.path.abspath(sys.argv[1])
     if not os.path.exists(video_path):
-        print_error(f"File not found: {video_path}")
+        fatal(f"File not found: {video_path}")
     if not check_comfyui():
-        print_error("ComfyUI is not running!")
+        fatal("ComfyUI is not running!")
     if not os.path.exists(WORKFLOW_FULL) or not os.path.exists(WORKFLOW_TRANS):
-        print_error("One or both Workflow JSON files are missing in ~/.config/")
+        fatal("One or both Workflow JSON files are missing in ~/.config/comfyui/workflows/")
 
     video_dir = os.path.dirname(video_path)
     video_basename = os.path.splitext(os.path.basename(video_path))[0]
-
-    master_wav_filepath = os.path.join(
-        CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_master.wav"
-    )
+    master_audio_path = os.path.join(CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_master.flac")
 
     # Final outputs
-    final_srt_filepath = os.path.join(video_dir, f"{video_basename}.srt")
-    final_orig_srt_filepath = os.path.join(video_dir, f"{video_basename}.orig.srt")
+    final_srt = os.path.join(video_dir, f"{video_basename}.srt")
+    final_orig_srt = os.path.join(video_dir, f"{video_basename}.orig.srt")
 
-    # Temporary working files for safety
-    temp_srt_filepath = os.path.join(
-        CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_FINAL.srt"
-    )
-    temp_orig_srt_filepath = os.path.join(
-        CACHE_DIR, f"{TEMP_PREFIX}_{video_basename}_FINAL.orig.srt"
-    )
+    # Try to resume from manifest
+    m = load_manifest(video_basename, video_path)
+    purge_vram = False  # normal operation: keep models loaded
 
-    mp3s_to_cleanup = [master_wav_filepath]
-    texts_to_cleanup = []
+    if m:
+        effective_chunk = m["effective_chunk_size"]
+        completed = sum(1 for c in m["chunks"] if c["status"] == "complete")
+        total = len(m["chunks"])
+        print_step(f"Resuming from manifest: {completed}/{total} chunks done (chunk size: {effective_chunk}s)")
+    else:
+        # Fresh start: extract audio, detect silences, build manifest
+        extract_base_audio(video_path, master_audio_path)
+        total_duration = get_audio_duration(master_audio_path)
+        print_step(f"Media duration: {total_duration:.2f}s")
+
+        effective_chunk = GLOBAL_CHUNK_SECONDS
+        print_step(f"Detecting silence boundaries (target chunk: {effective_chunk}s)...")
+        silences = detect_silences(master_audio_path)
+        print_step(f"Found {len(silences)} silence regions.")
+
+        boundaries = build_chunk_boundaries(total_duration, effective_chunk, silences)
+        m = create_manifest(video_path, video_basename, total_duration, effective_chunk, boundaries)
+        save_manifest(m, video_basename)
+        print_step(f"Created {len(boundaries)} chunks.")
+
+    # Ensure master audio exists for resumed runs
+    if not os.path.exists(master_audio_path):
+        extract_base_audio(video_path, master_audio_path)
 
     try:
-        extract_base_audio(video_path, master_wav_filepath)
-        total_duration = get_audio_duration(master_wav_filepath)
-        print_step(f"Media duration: {total_duration:.2f}s. Calculating windows...")
+        # Process chunks in a while loop so we can restart iteration after OOM re-splits
+        restart = True
+        while restart:
+            restart = False
+            total_chunks = len(m["chunks"])
 
-        with (
-            open(temp_srt_filepath, "w", encoding="utf-8") as srt_out,
-            open(temp_orig_srt_filepath, "w", encoding="utf-8") as orig_srt_out,
-        ):
-            srt_counter = 1
-            orig_srt_counter = 1
-            chunk_index = 0
-            current_start = 0.0
-            total_chunks = (
-                math.ceil(total_duration / (CHUNK_SECONDS - OVERLAP_SECONDS))
-                if total_duration
-                else 0
-            )
+            for chunk in m["chunks"]:
+                if chunk["status"] == "complete":
+                    continue
 
-            while current_start < total_duration:
-                chunk_id = f"{TEMP_PREFIX}_{video_basename}_{chunk_index:03d}"
-                chunk_mp3_name = f"{chunk_id}.mp3"
-                chunk_mp3_path = os.path.join(COMFY_INPUT_DIR, chunk_mp3_name)
-                mp3s_to_cleanup.append(chunk_mp3_path)
-
-                raw_txt_name = f"{chunk_id}_raw"
-                trans_txt_name = f"{chunk_id}_trans"
-
-                raw_txt_path = os.path.join(CACHE_DIR, f"{raw_txt_name}.txt")
-                trans_txt_path = os.path.join(CACHE_DIR, f"{trans_txt_name}.txt")
-
-                texts_to_cleanup.extend([raw_txt_path, trans_txt_path])
-
-                # CHECK CACHE: Decide which workflow to run
-                if os.path.exists(raw_txt_path) and os.path.getsize(raw_txt_path) > 0:
-                    print_step(
-                        f"Chunk {chunk_index + 1}/{total_chunks} (Start: {current_start}s): Found cached raw text! Skipping ASR, running Translation only..."
-                    )
-
-                    with open(WORKFLOW_TRANS, "r", encoding="utf-8") as f:
-                        workflow = json.load(f)
-
-                    # Read the raw text to inject into the translate workflow
-                    # with open(raw_txt_path, "r", encoding="utf-8") as f:
-                    #     raw_content = f.read()
-
-                    # Inject text into the target node (assumes a string primitive or text input node)
-                    workflow[NODE_TRANS_TEXT_INPUT]["inputs"]["file_path"] = (
-                        raw_txt_path
-                    )
-                    workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["output_file_path"] = (
-                        CACHE_DIR
-                    )
-                    workflow[NODE_TRANS_SAVE_TRANS]["inputs"]["file_name"] = (
-                        trans_txt_name
-                    )
-
-                else:
-                    print_step(
-                        f"Chunk {chunk_index + 1}/{total_chunks} (Start: {current_start}s): Extracting audio and running FULL ASR + Translation..."
-                    )
-                    extract_chunk(
-                        master_wav_filepath,
-                        chunk_mp3_path,
-                        current_start,
-                        CHUNK_SECONDS,
-                    )
-
-                    with open(WORKFLOW_FULL, "r", encoding="utf-8") as f:
-                        workflow = json.load(f)
-
-                    workflow[NODE_FULL_AUDIO_LOAD]["inputs"]["audio"] = chunk_mp3_name
-
-                    # Save RAW output
-                    workflow[NODE_FULL_SAVE_RAW]["inputs"]["output_file_path"] = (
-                        CACHE_DIR
-                    )
-                    workflow[NODE_FULL_SAVE_RAW]["inputs"]["file_name"] = raw_txt_name
-
-                    # Save TRANSLATED output
-                    workflow[NODE_FULL_SAVE_TRANS]["inputs"]["output_file_path"] = (
-                        CACHE_DIR
-                    )
-                    workflow[NODE_FULL_SAVE_TRANS]["inputs"]["file_name"] = (
-                        trans_txt_name
-                    )
-
-                # Queue and Poll ComfyUI
-                prompt_id = queue_prompt(workflow)["prompt_id"]
-                while True:
-                    if prompt_id in get_history(prompt_id):
-                        break
-                    sys.stdout.write(".")
-                    sys.stdout.flush()
-                    time.sleep(2)
-                print()
-
-                # Validate Outputs
-                if not os.path.exists(raw_txt_path) or not os.path.exists(
-                    trans_txt_path
-                ):
-                    print_error(
-                        f"ComfyUI output missing for chunk {chunk_index + 1}. Ensure Node IDs match your JSON."
-                    )
-
-                # Calculate Overlap Boundaries
-                min_keep = (
-                    0.0 if chunk_index == 0 else current_start + (OVERLAP_SECONDS / 2)
-                )
-                max_keep = (
-                    float("inf")
-                    if current_start + CHUNK_SECONDS >= total_duration
-                    else current_start + CHUNK_SECONDS - (OVERLAP_SECONDS / 2)
+                i = chunk["index"]
+                print_step(
+                    f"Chunk {i + 1}/{total_chunks} "
+                    f"[{chunk['start']:.1f}s \u2192 {chunk['end']:.1f}s] "
+                    f"(status: {chunk['status']})"
                 )
 
-                # Process and append both files
-                orig_srt_counter = process_and_append_srt(
-                    raw_txt_path,
-                    orig_srt_out,
-                    current_start,
-                    min_keep,
-                    max_keep,
-                    orig_srt_counter,
-                )
-                srt_counter = process_and_append_srt(
-                    trans_txt_path,
-                    srt_out,
-                    current_start,
-                    min_keep,
-                    max_keep,
-                    srt_counter,
-                )
-
-                current_start += STEP_SECONDS
-                chunk_index += 1
-
-        # SUCCESS: Move both temp SRTs to final destinations
-        shutil.move(temp_orig_srt_filepath, final_orig_srt_filepath)
-        shutil.move(temp_srt_filepath, final_srt_filepath)
-        print_success(
-            f"Done! Saved:\n - {final_srt_filepath}\n - {final_orig_srt_filepath}"
-        )
-
-        # ONLY delete cached text files upon complete video success
-        for txt_file in texts_to_cleanup:
-            if os.path.exists(txt_file):
-                os.remove(txt_file)
-    except Exception as ex:
-        print(ex)
-    finally:
-        # Always clean up audio/mp3 files and the temp SRTs (if they weren't successfully moved)
-        for file in mp3s_to_cleanup + [temp_srt_filepath, temp_orig_srt_filepath]:
-            if os.path.exists(file):
                 try:
-                    os.remove(file)
-                except Exception:
-                    pass
+                    chunk = process_chunk(chunk, video_basename, master_audio_path, purge_vram)
+                    m["chunks"][i] = chunk
+                    save_manifest(m, video_basename)
+                    purge_vram = False  # reset after success
+
+                except OOMError as e:
+                    print_error(str(e))
+
+                    old_size = m["effective_chunk_size"]
+                    new_size = max(old_size // 2, MIN_CHUNK_SECONDS)
+                    if new_size == old_size:
+                        raise AutoSubError(
+                            f"Already at minimum chunk size ({MIN_CHUNK_SECONDS}s) and still OOM. "
+                            "Try closing other GPU applications."
+                        )
+
+                    print_warn(f"Halving chunk size: {old_size}s \u2192 {new_size}s")
+                    purge_vram = True  # purge on next attempt to free VRAM
+
+                    m = resplit_remaining(m, i, new_size, video_basename, master_audio_path)
+                    save_manifest(m, video_basename)
+                    print_step(f"Re-split into {len(m['chunks']) - i} new chunks. Retrying...")
+
+                    restart = True  # break inner for-loop, restart from top of while
+                    break
+
+        # All chunks complete — build final SRT files
+        print_step("All chunks processed. Building final SRT files...")
+        orig_srt_content = build_srt_from_manifest(m, "raw")
+        trans_srt_content = build_srt_from_manifest(m, "trans")
+
+        with open(final_orig_srt, "w", encoding="utf-8") as f:
+            f.write(orig_srt_content)
+        with open(final_srt, "w", encoding="utf-8") as f:
+            f.write(trans_srt_content)
+
+        print_success(f"Done! Saved:\n  - {final_srt}\n  - {final_orig_srt}")
+        cleanup_cache(m, video_basename)
+
+    except AutoSubError as ex:
+        print_error(str(ex))
+        print_step("Progress saved in manifest. Re-run the same command to resume.")
+        sys.exit(1)
+    except Exception as ex:
+        print_error(f"Unexpected error: {ex}")
+        print_step("Progress saved in manifest. Re-run the same command to resume.")
+        sys.exit(1)
+    finally:
+        # Always clean up master audio (large file)
+        try:
+            if os.path.exists(master_audio_path):
+                os.remove(master_audio_path)
+        except OSError:
+            pass
+
+
+def cleanup_cache(m, video_basename):
+    """Remove all cached text files and the manifest on success."""
+    for chunk in m["chunks"]:
+        for key in ("raw_txt", "trans_txt"):
+            p = os.path.join(CACHE_DIR, chunk[key])
+            if os.path.exists(p):
+                os.remove(p)
+    delete_manifest(video_basename)
+    print_step("Cache cleaned up.")
 
 
 if __name__ == "__main__":
