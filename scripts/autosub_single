@@ -66,6 +66,10 @@ class OOMError(AutoSubError):
     """ComfyUI ran out of VRAM."""
 
 
+def print_metric(msg):
+    print(f"\033[95m[METRIC]\033[0m {msg}")
+
+
 def print_error(msg):
     print(f"\033[91m[ERROR]\033[0m {msg}")
 
@@ -73,6 +77,17 @@ def print_error(msg):
 def fatal(msg):
     print_error(msg)
     sys.exit(1)
+
+
+def format_duration(seconds):
+    """Format seconds into a human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
 
 
 # ================= COMFYUI API =================
@@ -582,6 +597,9 @@ def main():
     if not os.path.exists(master_audio_path):
         extract_base_audio(video_path, master_audio_path)
 
+    file_start_time = time.time()
+    oom_retries = 0
+
     try:
         # Process chunks in a while loop so we can restart iteration after OOM re-splits
         restart = True
@@ -594,6 +612,7 @@ def main():
                     continue
 
                 i = chunk["index"]
+                chunk_audio_dur = chunk["end"] - chunk["start"]
                 print_step(
                     f"Chunk {i + 1}/{total_chunks} "
                     f"[{chunk['start']:.1f}s \u2192 {chunk['end']:.1f}s] "
@@ -601,13 +620,23 @@ def main():
                 )
 
                 try:
+                    chunk_start_time = time.time()
                     chunk = process_chunk(chunk, video_basename, master_audio_path, purge_vram)
+                    chunk_elapsed = time.time() - chunk_start_time
+                    realtime_ratio = chunk_audio_dur / chunk_elapsed if chunk_elapsed > 0 else 0
+
                     m["chunks"][i] = chunk
                     save_manifest(m, video_basename)
                     purge_vram = False  # reset after success
 
+                    print_metric(
+                        f"  Chunk {i + 1}: {format_duration(chunk_elapsed)} "
+                        f"({format_duration(chunk_audio_dur)} audio @ {realtime_ratio:.1f}x realtime)"
+                    )
+
                 except OOMError as e:
                     print_error(str(e))
+                    oom_retries += 1
 
                     old_size = m["effective_chunk_size"]
                     new_size = max(old_size // 2, MIN_CHUNK_SECONDS)
@@ -638,6 +667,19 @@ def main():
             f.write(trans_srt_content)
 
         print_success(f"Done! Saved:\n  - {final_srt}\n  - {final_orig_srt}")
+
+        # Summary metrics
+        file_elapsed = time.time() - file_start_time
+        total_audio = m["total_duration"]
+        overall_ratio = total_audio / file_elapsed if file_elapsed > 0 else 0
+        sub_count = trans_srt_content.count("\n\n")
+        print_metric(
+            f"  Total: {format_duration(file_elapsed)} for {format_duration(total_audio)} audio "
+            f"({overall_ratio:.1f}x realtime) | "
+            f"{len(m['chunks'])} chunks | {sub_count} subtitles"
+            + (f" | {oom_retries} OOM retries" if oom_retries else "")
+        )
+
         cleanup_cache(m, video_basename)
 
     except AutoSubError as ex:

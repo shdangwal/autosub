@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import time
 import subprocess
 
 # Define the video formats you want to process
@@ -19,8 +20,22 @@ def print_skip(msg):
     print(f"\033[93m[BATCH SKIP]\033[0m {msg}")
 
 
+def print_metric(msg):
+    print(f"\033[95m[BATCH METRIC]\033[0m {msg}")
+
+
 def print_error(msg):
     print(f"\033[91m[BATCH ERROR]\033[0m {msg}")
+
+
+def format_duration(seconds):
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    return f"{m}m {s:02d}s"
 
 
 def main():
@@ -51,6 +66,13 @@ def main():
     processed_count = 0
     skipped_count = 0
     error_log = []  # List to track any files that fail
+    file_times = []  # Track per-file processing times
+    to_process = len(video_files) - sum(
+        1 for f in video_files
+        if os.path.exists(os.path.join(target_dir, f"{os.path.splitext(f)[0]}.srt"))
+    )
+
+    batch_start = time.time()
 
     for idx, video_file in enumerate(sorted(video_files)):
         video_path = os.path.join(target_dir, video_file)
@@ -65,32 +87,48 @@ def main():
             skipped_count += 1
             continue
 
-        print_info(f"{idx + 1}/{len(video_files)}: Processing: '{video_file}'")
+        # ETA based on files processed so far
+        eta_str = ""
+        if file_times:
+            avg_time = sum(file_times) / len(file_times)
+            remaining_files = to_process - len(file_times)
+            eta_str = f" | ETA: {format_duration(avg_time * remaining_files)}"
+
+        print_info(f"{idx + 1}/{len(video_files)}: Processing: '{video_file}'{eta_str}")
 
         try:
+            file_start = time.time()
             result = subprocess.run(["autosub_single", video_path])
+            file_elapsed = time.time() - file_start
+
             if result.returncode == 0:
                 processed_count += 1
+                file_times.append(file_elapsed)
+                print_metric(f"'{video_file}' completed in {format_duration(file_elapsed)}")
             else:
-                print_error(f"autosub failed on '{video_file}'.")
-                # Record the failure for the final summary
+                print_error(f"autosub failed on '{video_file}' after {format_duration(file_elapsed)}.")
                 error_log.append(
                     f"Failed on: '{video_file}' (Exit code: {result.returncode})"
                 )
         except FileNotFoundError:
-            fatal_msg = "FATAL: The 'autosub' command was not found in PATH."
+            fatal_msg = "FATAL: The 'autosub_single' command was not found in PATH."
             print_error(fatal_msg)
             error_log.append(fatal_msg)
-            # If the command doesn't exist, no point in continuing the loop
             break
 
         print("-" * 50)
 
-    # Fnal Output
+    # Final Output
+    batch_elapsed = time.time() - batch_start
     print("\n" + "=" * 50)
     print_success(
-        f"Batch run complete! Processed: {processed_count} | Skipped: {skipped_count}"
+        f"Batch run complete! Processed: {processed_count} | Skipped: {skipped_count} | "
+        f"Failed: {len(error_log)}"
     )
+    print_metric(f"Total batch time: {format_duration(batch_elapsed)}")
+    if file_times:
+        avg = sum(file_times) / len(file_times)
+        print_metric(f"Average per file: {format_duration(avg)}")
     print("=" * 50)
 
     # Print the consolidated error summary if any occurred
