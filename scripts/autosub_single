@@ -486,15 +486,19 @@ def process_chunk(chunk, video_basename, master_audio_path, purge_vram):
         print()  # newline after dots
 
         # Validate outputs and update status
-        raw_exists = os.path.exists(raw_txt_path) and os.path.getsize(raw_txt_path) > 0
-        trans_exists = os.path.exists(trans_txt_path) and os.path.getsize(trans_txt_path) > 0
+        # poll_prompt succeeded — if files are missing, the segment had no speech
+        # (ComfyUI's saveText node skips writing when input text is empty)
+        for p in (raw_txt_path, trans_txt_path):
+            if not os.path.exists(p):
+                open(p, "w").close()
+                print_warn(f"  No output from ComfyUI for {os.path.basename(p)} — no speech in segment.")
 
-        if chunk["status"] != "asr_complete" and raw_exists and not trans_exists:
-            chunk["status"] = "asr_complete"
-        elif raw_exists and trans_exists:
+        if chunk["status"] == "asr_complete":
+            chunk["status"] = "complete"
+        elif os.path.exists(raw_txt_path) and os.path.exists(trans_txt_path):
             chunk["status"] = "complete"
         else:
-            raise AutoSubError(f"ComfyUI output missing for chunk {i + 1}. Check Node IDs.")
+            raise AutoSubError(f"ComfyUI output files missing for chunk {i + 1}. Check Node IDs.")
 
     finally:
         # Always clean up the chunk mp3 from ComfyUI input dir
