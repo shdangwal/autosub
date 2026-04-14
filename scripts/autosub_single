@@ -29,6 +29,10 @@ SILENCE_NOISE_DB = -30
 SILENCE_MIN_DURATION = 0.3
 SILENCE_SNAP_WINDOW = 30  # how far (seconds) from target split to look for silence
 
+# Translation retry (Google Translate rate-limiting returns untranslated CJK text)
+MAX_TRANSLATE_RETRIES = 3
+TRANSLATE_RETRY_DELAY = 15  # seconds to wait between retries
+
 # === NODE CONFIGURATION (UPDATE THESE TO MATCH YOUR JSONS) ===
 # For autosub_workflow.json (Full Pipeline)
 NODE_FULL_AUDIO_LOAD = "31"
@@ -88,6 +92,11 @@ def format_duration(seconds):
     if h > 0:
         return f"{h}h {m:02d}m {s:02d}s"
     return f"{m}m {s:02d}s"
+
+
+def contains_cjk(text):
+    """Return True if text contains CJK Unified Ideographs (Chinese characters)."""
+    return bool(re.search(r'[\u4e00-\u9fff]', text))
 
 
 # ================= COMFYUI API =================
@@ -383,9 +392,12 @@ def build_srt_from_manifest(m, srt_type):
 
     srt_type: "raw" for orig.srt, "trans" for .srt
     """
-    # raw text exists for asr_complete and complete chunks
-    # trans text only exists for complete chunks
-    valid_statuses = {"asr_complete", "complete"} if srt_type == "raw" else {"complete"}
+    # raw text exists for asr_complete, translated, and complete chunks
+    # trans text exists for translated and complete chunks
+    if srt_type == "raw":
+        valid_statuses = {"asr_complete", "translated", "complete"}
+    else:
+        valid_statuses = {"translated", "complete"}
 
     lines = []
     counter = 1
@@ -450,8 +462,16 @@ def load_trans_workflow(raw_txt_path, trans_txt_name, purge_vram):
 # ================= CHUNK PROCESSING =================
 
 
-def process_chunk(chunk, video_basename, master_audio_path, purge_vram):
+def process_chunk(chunk, m, video_basename, master_audio_path, purge_vram):
     """Process a single chunk through ComfyUI. Returns updated chunk dict.
+
+    Status transitions:
+        pending       → translated → complete
+        asr_complete  → translated → complete
+        translated    →              complete   (CJK verification only)
+
+    The manifest is saved at the "translated" checkpoint so that an interrupted
+    CJK verification can resume without re-running translation.
 
     Raises OOMError if ComfyUI runs out of VRAM.
     Raises AutoSubError for other failures.
@@ -471,34 +491,62 @@ def process_chunk(chunk, video_basename, master_audio_path, purge_vram):
     trans_txt_path = os.path.join(CACHE_DIR, chunk["trans_txt"])
 
     try:
-        if chunk["status"] == "asr_complete":
-            # Raw text exists, only need translation
-            print_step(f"  Cached raw text found. Running translation only...")
-            workflow = load_trans_workflow(raw_txt_path, trans_txt_name, purge_vram)
+        # Phase 1: Produce translation files (skip if already "translated")
+        if chunk["status"] == "translated":
+            print_step(f"  Translation exists, verifying CJK...")
         else:
-            # Full pipeline: extract audio chunk → ASR → translate
-            print_step(f"  Extracting audio chunk ({duration:.1f}s) and running full pipeline...")
-            extract_chunk(master_audio_path, chunk_mp3_path, start, duration)
-            workflow = load_full_workflow(chunk_mp3_name, raw_txt_name, trans_txt_name, purge_vram)
+            if chunk["status"] == "asr_complete":
+                print_step(f"  Cached raw text found. Running translation only...")
+                workflow = load_trans_workflow(raw_txt_path, trans_txt_name, purge_vram)
+            else:
+                print_step(f"  Extracting audio chunk ({duration:.1f}s) and running full pipeline...")
+                extract_chunk(master_audio_path, chunk_mp3_path, start, duration)
+                workflow = load_full_workflow(chunk_mp3_name, raw_txt_name, trans_txt_name, purge_vram)
 
-        prompt_id = queue_prompt(workflow)["prompt_id"]
-        poll_prompt(prompt_id)
-        print()  # newline after dots
+            prompt_id = queue_prompt(workflow)["prompt_id"]
+            poll_prompt(prompt_id)
+            print()  # newline after dots
 
-        # Validate outputs and update status
-        # poll_prompt succeeded — if files are missing, the segment had no speech
-        # (ComfyUI's saveText node skips writing when input text is empty)
-        for p in (raw_txt_path, trans_txt_path):
-            if not os.path.exists(p):
-                open(p, "w").close()
-                print_warn(f"  No output from ComfyUI for {os.path.basename(p)} — no speech in segment.")
+            # Validate outputs — ComfyUI's saveText skips writing when input is empty
+            for p in (raw_txt_path, trans_txt_path):
+                if not os.path.exists(p):
+                    open(p, "w").close()
+                    print_warn(f"  No output from ComfyUI for {os.path.basename(p)} — no speech in segment.")
 
-        if chunk["status"] == "asr_complete":
-            chunk["status"] = "complete"
-        elif os.path.exists(raw_txt_path) and os.path.exists(trans_txt_path):
-            chunk["status"] = "complete"
-        else:
-            raise AutoSubError(f"ComfyUI output files missing for chunk {i + 1}. Check Node IDs.")
+            if not (os.path.exists(raw_txt_path) and os.path.exists(trans_txt_path)):
+                raise AutoSubError(f"ComfyUI output files missing for chunk {i + 1}. Check Node IDs.")
+
+            # Checkpoint: translation files exist but CJK verification pending
+            chunk["status"] = "translated"
+            save_manifest(m, video_basename)
+
+        # Phase 2: Verify translation doesn't contain untranslated CJK text
+        if os.path.exists(trans_txt_path):
+            for retry in range(MAX_TRANSLATE_RETRIES):
+                with open(trans_txt_path, "r", encoding="utf-8") as f:
+                    trans_content = f.read()
+                if not contains_cjk(trans_content):
+                    break
+                print_warn(
+                    f"  CJK text detected in translation (retry {retry + 1}/{MAX_TRANSLATE_RETRIES}). "
+                    f"Waiting {TRANSLATE_RETRY_DELAY}s..."
+                )
+                time.sleep(TRANSLATE_RETRY_DELAY)
+                workflow = load_trans_workflow(raw_txt_path, trans_txt_name, purge_vram)
+                prompt_id = queue_prompt(workflow)["prompt_id"]
+                poll_prompt(prompt_id)
+                print()
+            else:
+                # All retries exhausted — check if last attempt succeeded
+                with open(trans_txt_path, "r", encoding="utf-8") as f:
+                    trans_content = f.read()
+                if contains_cjk(trans_content):
+                    print_warn(
+                        f"  Chunk {i + 1} still has untranslated CJK text after "
+                        f"{MAX_TRANSLATE_RETRIES} retries. Continuing anyway."
+                    )
+
+        chunk["status"] = "complete"
 
     finally:
         # Always clean up the chunk mp3 from ComfyUI input dir
@@ -625,7 +673,7 @@ def main():
 
                 try:
                     chunk_start_time = time.time()
-                    chunk = process_chunk(chunk, video_basename, master_audio_path, purge_vram)
+                    chunk = process_chunk(chunk, m, video_basename, master_audio_path, purge_vram)
                     chunk_elapsed = time.time() - chunk_start_time
                     realtime_ratio = chunk_audio_dur / chunk_elapsed if chunk_elapsed > 0 else 0
 

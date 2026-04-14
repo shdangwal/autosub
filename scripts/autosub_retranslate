@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Repair .srt files by retranslating lines that still contain CJK characters.
+
+Usage:
+    autosub_retranslate <file_or_directory> [--target-lang LANG] [--dry-run]
+
+Scans .srt files for subtitle lines containing CJK Unified Ideographs
+(U+4E00–U+9FFF), translates them via Google Translate API, and rewrites
+the .srt file in place (with a .bak backup).
+"""
+
+import sys
+import os
+import re
+import time
+import json
+import shutil
+import urllib.request
+import urllib.parse
+import urllib.error
+
+# Configuration
+TARGET_LANG = "en"
+SOURCE_LANG = "auto"
+BATCH_SIZE = 20           # subtitle lines per API call
+BATCH_DELAY = 2.0         # seconds between batches
+RETRY_DELAY = 15.0        # seconds on rate-limit / error
+MAX_RETRIES = 3
+
+CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
+
+
+def print_step(msg):
+    print(f"\033[94m[INFO]\033[0m {msg}")
+
+
+def print_success(msg):
+    print(f"\033[92m[OK]\033[0m {msg}")
+
+
+def print_warn(msg):
+    print(f"\033[93m[WARN]\033[0m {msg}")
+
+
+def print_error(msg):
+    print(f"\033[91m[ERROR]\033[0m {msg}")
+
+
+def contains_cjk(text):
+    """Return True if text contains CJK Unified Ideographs."""
+    return bool(CJK_PATTERN.search(text))
+
+
+def google_translate(text, target_lang=TARGET_LANG, source_lang=SOURCE_LANG):
+    """Translate text via Google Translate unofficial API. Returns translated text."""
+    url = (
+        "https://translate.googleapis.com/translate_a/single"
+        f"?client=gtx&sl={source_lang}&tl={target_lang}&dt=t&q="
+        + urllib.parse.quote(text)
+    )
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("User-Agent", "Mozilla/5.0")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            # Response format: [[["translated","original",null,null,N], ...], ...]
+            translated_parts = []
+            if data and data[0]:
+                for part in data[0]:
+                    if part[0]:
+                        translated_parts.append(part[0])
+            result = "".join(translated_parts)
+
+            if contains_cjk(result) and attempt < MAX_RETRIES - 1:
+                print_warn(f"  Translation still contains CJK (attempt {attempt + 1}). "
+                           f"Retrying in {RETRY_DELAY:.0f}s...")
+                time.sleep(RETRY_DELAY)
+                continue
+            return result
+
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            if attempt < MAX_RETRIES - 1:
+                print_warn(f"  API error: {e}. Retrying in {RETRY_DELAY:.0f}s...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print_error(f"  Translation failed after {MAX_RETRIES} attempts: {e}")
+                return text  # return original on failure
+
+    return text
+
+
+def parse_srt(filepath):
+    """Parse an SRT file into a list of entry dicts with number, timecodes, text."""
+    with open(filepath, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    entries = []
+    blocks = re.split(r'\n\n+', content.strip())
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) >= 3:
+            number = lines[0].strip()
+            timecodes = lines[1].strip()
+            text = '\n'.join(lines[2:])
+            entries.append({"number": number, "timecodes": timecodes, "text": text})
+    return entries
+
+
+def write_srt(filepath, entries):
+    """Write entries back to an SRT file."""
+    with open(filepath, "w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(f"{entry['number']}\n")
+            f.write(f"{entry['timecodes']}\n")
+            f.write(f"{entry['text']}\n\n")
+
+
+def repair_srt(filepath, target_lang):
+    """Find CJK lines in an SRT file, retranslate them, and rewrite the file.
+
+    Returns the number of lines successfully retranslated.
+    """
+    entries = parse_srt(filepath)
+    if not entries:
+        return 0
+
+    cjk_indices = [i for i, e in enumerate(entries) if contains_cjk(e["text"])]
+    if not cjk_indices:
+        return 0
+
+    total = len(entries)
+    affected = len(cjk_indices)
+    print_step(f"  {affected}/{total} lines with CJK text ({affected / total * 100:.1f}%)")
+
+    translated = 0
+    for batch_start in range(0, len(cjk_indices), BATCH_SIZE):
+        batch_indices = cjk_indices[batch_start:batch_start + BATCH_SIZE]
+        batch_texts = [entries[i]["text"] for i in batch_indices]
+
+        # Join with newlines for batch translation
+        combined = "\n".join(batch_texts)
+        result = google_translate(combined, target_lang=target_lang)
+        result_lines = result.split("\n")
+
+        if len(result_lines) == len(batch_texts):
+            for idx, translated_text in zip(batch_indices, result_lines):
+                translated_text = translated_text.strip()
+                if translated_text and not contains_cjk(translated_text):
+                    entries[idx]["text"] = translated_text
+                    translated += 1
+                else:
+                    print_warn(f"  Line {entries[idx]['number']}: still CJK after translation")
+        else:
+            # Batch split mismatch — fall back to one-by-one
+            print_warn(f"  Batch mismatch ({len(result_lines)} vs {len(batch_texts)}). "
+                       "Translating individually...")
+            for idx in batch_indices:
+                result = google_translate(entries[idx]["text"], target_lang=target_lang)
+                if result and not contains_cjk(result):
+                    entries[idx]["text"] = result.strip()
+                    translated += 1
+                else:
+                    print_warn(f"  Line {entries[idx]['number']}: still CJK after translation")
+                time.sleep(BATCH_DELAY)
+
+        # Delay between batches to avoid rate-limiting
+        if batch_start + BATCH_SIZE < len(cjk_indices):
+            time.sleep(BATCH_DELAY)
+
+    if translated > 0:
+        backup = filepath + ".bak"
+        if not os.path.exists(backup):
+            shutil.copy2(filepath, backup)
+        write_srt(filepath, entries)
+
+    return translated
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Retranslate CJK lines in .srt files via Google Translate"
+    )
+    parser.add_argument("path", help="SRT file or directory to scan")
+    parser.add_argument("--target-lang", default="en",
+                        help="Target language code (default: en)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show affected lines without modifying files")
+    args = parser.parse_args()
+
+    path = os.path.abspath(args.path)
+
+    if os.path.isfile(path):
+        if not path.endswith(".srt"):
+            print_error("File must be a .srt file")
+            sys.exit(1)
+        srt_files = [path]
+    elif os.path.isdir(path):
+        # Skip .orig.srt (raw ASR) and .bak files
+        srt_files = sorted(
+            os.path.join(path, f)
+            for f in os.listdir(path)
+            if f.endswith(".srt") and not f.endswith(".orig.srt") and not f.endswith(".bak")
+        )
+    else:
+        print_error(f"Path not found: {path}")
+        sys.exit(1)
+
+    if not srt_files:
+        print_step("No .srt files found.")
+        return
+
+    # Scan phase — find files with CJK text
+    files_with_cjk = []
+    for srt_file in srt_files:
+        entries = parse_srt(srt_file)
+        cjk_count = sum(1 for e in entries if contains_cjk(e["text"]))
+        if cjk_count > 0:
+            files_with_cjk.append((srt_file, cjk_count, len(entries)))
+
+    if not files_with_cjk:
+        print_success("All .srt files are clean — no CJK text found.")
+        return
+
+    total_cjk = sum(c for _, c, _ in files_with_cjk)
+    print_step(f"Found {len(files_with_cjk)} file(s) with {total_cjk} untranslated CJK lines:")
+    for srt_file, cjk_count, total in files_with_cjk:
+        name = os.path.basename(srt_file)
+        print(f"  {name}: {cjk_count}/{total} lines ({cjk_count / total * 100:.1f}%)")
+
+    if args.dry_run:
+        print_step("Dry run — no changes made.")
+        return
+
+    # Repair phase
+    print()
+    print_step("Starting retranslation...")
+    total_fixed = 0
+    for srt_file, cjk_count, total in files_with_cjk:
+        name = os.path.basename(srt_file)
+        print_step(f"Processing: {name}")
+        fixed = repair_srt(srt_file, args.target_lang)
+        total_fixed += fixed
+        if fixed > 0:
+            print_success(f"  Fixed {fixed}/{cjk_count} lines")
+        else:
+            print_warn(f"  Could not fix any lines")
+
+    print()
+    print_success(f"Done! Fixed {total_fixed}/{total_cjk} lines across {len(files_with_cjk)} file(s).")
+    if total_fixed < total_cjk:
+        print_warn(f"  {total_cjk - total_fixed} lines could not be translated. "
+                   "Try running again later.")
+
+
+if __name__ == "__main__":
+    main()

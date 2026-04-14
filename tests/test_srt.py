@@ -219,7 +219,35 @@ def test_build_srt_raw_includes_asr_complete(mod):
             raw_srt = mod.build_srt_from_manifest(manifest, "raw")
             trans_srt = mod.build_srt_from_manifest(manifest, "trans")
             assert "ASR only chunk" in raw_srt
-            assert trans_srt == ""  # trans requires "complete" status
+            assert trans_srt == ""  # trans requires "translated" or "complete"
+        finally:
+            mod.CACHE_DIR = original_cache
+
+
+def test_build_srt_includes_translated_status(mod):
+    """'translated' chunks (CJK check pending) should appear in both raw and trans SRT."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        raw0 = os.path.join(tmpdir, "chunk_000_raw.txt")
+        trans0 = os.path.join(tmpdir, "chunk_000_trans.txt")
+        with open(raw0, "w") as f:
+            f.write("0.0-2.0: Original speech\n")
+        with open(trans0, "w") as f:
+            f.write("0.0-2.0: Translated speech\n")
+
+        manifest = {
+            "chunks": [
+                {"index": 0, "start": 0.0, "end": 100.0, "status": "translated",
+                 "raw_txt": "chunk_000_raw.txt", "trans_txt": "chunk_000_trans.txt"},
+            ]
+        }
+
+        original_cache = mod.CACHE_DIR
+        mod.CACHE_DIR = tmpdir
+        try:
+            raw_srt = mod.build_srt_from_manifest(manifest, "raw")
+            trans_srt = mod.build_srt_from_manifest(manifest, "trans")
+            assert "Original speech" in raw_srt
+            assert "Translated speech" in trans_srt
         finally:
             mod.CACHE_DIR = original_cache
 
